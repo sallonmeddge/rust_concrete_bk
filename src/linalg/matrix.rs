@@ -1,0 +1,445 @@
+extern crate concrete;
+use self::concrete::*;
+use std::{str, fmt, ops, marker};
+use rand;
+use rand::distributions::{IndependentSample, Range};
+
+use linalg::strassen;
+
+#[derive(Debug, PartialEq)]
+pub struct Matrix<T> {
+    pub rows: usize,
+    pub columns: usize,
+    pub elements: Vec<T>,
+    pub row_major: bool
+}
+
+pub struct Matrix_con<> {
+    pub rows: usize,
+    pub columns: usize,
+    pub elements: Vec<LWE>,
+    pub row_major: bool
+}
+
+impl <> Matrix_con<> {
+    pub fn new_concrete(rows: usize, columns: usize, secret_key: &LWESecretKey, encoder: &Encoder) -> Matrix_con<> {
+        let mut elems = Vec::with_capacity(rows * columns);
+        // let elems2 = LWE::encode_encrypt(&secret_key, &elems, &encoder).unwrap();
+        elems.resize(rows * columns, LWE::encode_encrypt(&secret_key, 0.0, &encoder).unwrap());
+
+        // fin_ele.push(elems2);
+        Matrix_con {
+            rows: rows,
+            columns: columns,
+            elements: elems,
+            row_major: true
+        }
+    }
+    pub fn set_at(&mut self, row: usize, column: usize, value: LWE) {
+        debug_assert!(row < self.rows, "row is too large");
+        debug_assert!(column < self.columns, "column is too large");
+        if self.row_major {
+            self.elements[row * self.columns + column] = value
+        } else {
+            self.elements[column * self.rows + row] = value
+        }
+    }
+
+}
+
+
+
+impl <T: Clone + Default> Matrix<T> {
+    pub fn new(rows: usize, columns: usize) -> Matrix<T> {
+        let mut elems = Vec::with_capacity(rows * columns);
+        elems.resize(rows * columns, T::default());
+        Matrix {
+            rows: rows,
+            columns: columns,
+            elements: elems,
+            row_major: true
+        }
+    }
+
+    // pub fn new_concrete(rows: usize, columns: usize, secret_key: LWESecretKey, encoder: Encoder) -> Matrix_con<> {
+    //     let mut elems = Vec::with_capacity(rows * columns);
+    //     let elems2 = VectorLWE::encode_encrypt(&secret_key, &elems, &encoder).unwrap();
+    //     // elems.resize(rows * columns, T::default());
+    //     Matrix_con {
+    //         rows: rows,
+    //         columns: columns,
+    //         elements: elems2,
+    //         row_major: true
+    //     }
+    // }
+
+    pub fn t(&self) -> Matrix<T> {
+        Matrix::new_from(self.columns, self.rows, self.elements.to_owned(), !self.row_major)
+    }
+
+    pub fn slice_rows(&self, range: ops::Range<usize>) -> Matrix<T> {
+        let rows = range.end - range.start;
+        let mut mat = Matrix::new(rows, self.columns);
+
+        let mut new_row = 0;
+        for row in range {
+            for col in 0..self.columns {
+                mat.set_at(new_row, col, self.at(row, col));
+            }
+            new_row += 1;
+        }
+        mat
+    }
+}
+
+impl<T> Matrix<T> {
+    pub fn new_from<U>(rows: usize, columns: usize, elements: Vec<U>, row_major: bool) -> Matrix<T>
+            where T: From<U> {
+        debug_assert!(rows * columns == elements.len());
+        let mut elems = Vec::with_capacity(elements.len());
+        for elem in elements {
+            elems.push(T::from(elem));
+        }
+        Matrix {
+            rows: rows,
+            columns: columns,
+            elements: elems,
+            row_major: row_major
+        }
+    }
+
+    pub fn random<B>(rows: usize, columns: usize, min: B, max: B) -> Matrix<B>
+            where B: PartialOrd + rand::distributions::range::SampleRange {
+        let between = Range::new(min, max);
+        let mut rng = rand::thread_rng();
+        let mut elems = Vec::with_capacity(rows * columns);
+        for _ in 0..(rows * columns) {
+            elems.push(between.ind_sample(&mut rng));
+        }
+        Matrix {
+            rows: rows,
+            columns: columns,
+            elements: elems,
+            row_major: true
+        }
+    }
+
+    pub fn set_at(&mut self, row: usize, column: usize, value: T) {
+        debug_assert!(row < self.rows, "row is too large");
+        debug_assert!(column < self.columns, "column is too large");
+        if self.row_major {
+            self.elements[row * self.columns + column] = value
+        } else {
+            self.elements[column * self.rows + row] = value
+        }
+    }
+
+    pub fn assert_same_size(&self, other: &Matrix<T>) {
+        debug_assert!(self.rows == other.rows && self.columns == other.columns,
+                "matrix should have same size, given {}x{} and {}x{}",
+                self.rows, self.columns, other.rows, other.columns)
+    }
+}
+
+impl Matrix<usize> {
+    pub fn to_one_hot<T: From<u8> + Clone + Default>(&self, classes: usize) -> Matrix<T> {
+        debug_assert!(self.columns == 1, "matrix must be Nx1 to change to one_hot");
+        let mut matrix = Matrix::new(self.elements.len(), classes);
+        for i in 0..self.elements.len() {
+            matrix.set_at(i, self.elements[i], T::from(1));
+        }
+        matrix
+    }
+}
+
+impl<T> Matrix<T>
+        where T: Default + Clone + ops::Add<Output = T> + ops::Sub<Output = T> + ops::Mul<Output = T> + marker::Send + 'static {
+    pub fn serial_matmul(&self, other: &Matrix<T>) -> Matrix<T> {
+        let mut output = Matrix::new(self.rows, other.columns);
+        for row in 0..self.rows {
+            for col in 0..other.columns {
+                let mut v_ij = T::default();
+                for k in 0..self.columns {
+                    v_ij = v_ij + self.at(row, k) * other.at(k, col);
+                }
+                output.set_at(row, col, v_ij);
+            }
+        }
+        output
+    }
+
+    pub fn matmul(&self, other: &Matrix<T>) -> Matrix<T> {
+        debug_assert!(self.columns == other.rows, "trying to multiply {}x{} with {}x{}",
+            self.rows, self.columns, other.rows, other.columns);
+        if self.rows >= 64 && self.rows == self.columns {
+            strassen::mul(self, other)
+        } else {
+            self.serial_matmul(other)
+        }
+    }
+}
+
+impl<T: Clone> Matrix<T> {
+    pub fn cast<U: From<T>>(&self) -> Matrix<U> {
+        Matrix::new_from(self.rows, self.columns, self.elements.to_owned(), self.row_major)
+    }
+
+    fn make_mut_op<F>(&mut self, other: &Matrix<T>, mut op: F)
+            where F: FnMut(T, T) -> T {
+        self.assert_same_size(other);
+        for row in 0..self.rows {
+            for col in 0..self.columns {
+                let result = op(self.at(row, col), other.at(row, col));
+                self.set_at(row, col, result);
+            }
+        }
+    }
+
+    fn make_op<F>(&self, other: &Matrix<T>, op: F) -> Matrix<T>
+            where F: FnMut(T, T) -> T {
+        let mut output = self.clone();
+        output.make_mut_op(other, op);
+        output
+    }
+
+    pub fn at(&self, row: usize, column: usize) -> T {
+        debug_assert!(row < self.rows, "row is too large");
+        debug_assert!(column < self.columns, "column is too large");
+        if self.row_major {
+            self.elements[row * self.columns + column].clone()
+        } else {
+            self.elements[column * self.rows + row].clone()
+        }
+    }
+
+    pub fn reduce<F, B>(&self, init: B, mut f: F) -> B
+            where F: FnMut(B, T) -> B {
+        self.reduce_with_index(init, |acc, v, _row, _col| f(acc, v))
+    }
+
+    pub fn reduce_with_index<F, B>(&self, init: B, mut f: F) -> B
+            where F: FnMut(B, T, usize, usize) -> B {
+        let mut result = init;
+        for row in 0..self.rows {
+            for col in 0..self.columns {
+                result = f(result, self.at(row, col), row, col);
+            }
+        }
+        result
+    }
+
+    pub fn reduce_rows_with_index<F, B: Copy>(&self, init: B, mut f: F) -> Matrix<B>
+            where F: FnMut(B, T, usize, usize) -> B {
+        let mut elems = Vec::with_capacity(self.rows);
+        for row in 0..self.rows {
+            let mut result = init;
+            for col in 0..self.columns {
+                result = f(result, self.at(row, col), row, col);
+            }
+            elems.push(result);
+        }
+        Matrix::new_from(self.rows, 1, elems, self.row_major)
+    }
+
+    pub fn reduce_rows<F, B: Copy>(&self, init: B, mut f: F) -> Matrix<B>
+            where F: FnMut(B, T) -> B {
+        self.reduce_rows_with_index(init, |acc, v, _row, _col| f(acc, v))
+    }
+
+    pub fn reduce_columns<F, B: Copy>(&self, init: B, mut f: F) -> Matrix<B>
+            where F: FnMut(B, T) -> B {
+        self.reduce_columns_with_index(init, |acc, v, _row, _col| f(acc, v))
+    }
+
+    pub fn reduce_columns_with_index<F, B: Copy>(&self, init: B, mut f: F) -> Matrix<B>
+            where F: FnMut(B, T, usize, usize) -> B {
+        let mut elems = Vec::with_capacity(self.columns);
+        for col in 0..self.columns {
+            let mut result = init;
+            for row in 0..self.rows {
+                result = f(result, self.at(row, col), row, col);
+            }
+            elems.push(result);
+        }
+        Matrix::new_from(1, self.columns, elems, self.row_major)
+    }
+
+    pub fn transform<F, B: Default + Clone>(&self, mut f: F) -> Matrix<B>
+            where F: FnMut(T) -> B {
+        self.transform_with_index(|v, _row, _col| f(v))
+    }
+
+    pub fn transform_with_concrete<F>(&self, mut f: F, secret_key: LWESecretKey, encoder: Encoder) -> Matrix_con<>
+            where F: FnMut(T) -> f64 {
+        self.transform_with_concrete_index(|v, _row, _col| f(v), &secret_key, &encoder)
+    }
+
+    pub fn transform_with_index<F, B: Default + Clone>(&self, mut f: F) -> Matrix<B>
+            where F: FnMut(T, usize, usize) -> B {
+        let mut output = Matrix::new(self.rows, self.columns);
+        for row in 0..self.rows {
+            for col in 0..self.columns {
+                output.set_at(row, col, f(self.at(row, col), row, col));
+            }
+        }
+        output
+    }
+
+    pub fn transform_with_concrete_index<F>(&self, mut f: F, secret_key: &LWESecretKey, encoder: &Encoder) -> Matrix_con<>
+            where F: FnMut(T, usize, usize) -> f64 {
+        let mut output = Matrix_con::new_concrete(self.rows, self.columns, &secret_key, &encoder);
+        for row in 0..self.rows {
+            for col in 0..self.columns {
+                let k: f64 = f(self.at(row, col), row, col);
+                print!("{},{},{}\n", row, col, k);
+                let m = LWE::encode_encrypt(&secret_key, k, &encoder).unwrap();
+                if (row == 2 && col > 781){
+                    print!("{:?}\n", m);
+                }
+                output.set_at(row, col, m);
+
+            }
+        }
+        output
+    }
+
+    pub fn shuffle_rows(&mut self) -> Vec<(usize, usize)> {
+        let between = Range::new(0, self.rows);
+        let mut rng = rand::thread_rng();
+        let count = self.rows / 2;
+        let mut swaps = Vec::with_capacity(count);
+        for _ in 0..count {
+            let row = between.ind_sample(&mut rng);
+            let other = between.ind_sample(&mut rng);
+            self.swap_rows(row, other);
+            swaps.push((row, other));
+        }
+        swaps
+    }
+
+    pub fn swap_rows(&mut self, row: usize, other_row: usize) {
+        for i in 0..self.columns {
+            let value = self.at(row, i);
+            let other = self.at(other_row, i);
+            self.set_at(row, i, other);
+            self.set_at(other_row, i, value);
+        }
+    }
+}
+
+impl<T: ops::Add<Output = T> + Clone> Matrix<T> {
+    pub fn add_mut(&mut self, other: &Matrix<T>) {
+        self.make_mut_op(other, |a, b| a + b)
+    }
+}
+
+impl<T: ops::Sub<Output = T> + Clone> Matrix<T> {
+    pub fn sub_mut(&mut self, other: &Matrix<T>) {
+        self.make_mut_op(other, |a, b| a - b)
+    }
+}
+
+impl<T: ops::Mul<Output = T> + Clone> Matrix<T> {
+    pub fn mul_mut(&mut self, other: &Matrix<T>) {
+        self.make_mut_op(other, |a, b| a * b)
+    }
+}
+
+impl<T: ops::Div<Output = T> + Clone> Matrix<T> {
+    pub fn div_mut(&mut self, other: &Matrix<T>) {
+        self.make_mut_op(other, |a, b| a / b)
+    }
+}
+
+impl<'a, 'b, T: ops::Add<Output = T> + Clone> ops::Add<&'b Matrix<T>> for &'a Matrix<T> {
+    type Output = Matrix<T>;
+    fn add(self, other: &'b Matrix<T>) -> Matrix<T> {
+        self.make_op(&other, |a, b| a + b)
+    }
+}
+
+impl<'a, 'b, T: ops::Sub<Output = T> + Clone> ops::Sub<&'b Matrix<T>> for &'a Matrix<T> {
+    type Output = Matrix<T>;
+    fn sub(self, other: &'b Matrix<T>) -> Matrix<T> {
+        self.make_op(&other, |a, b| a - b)
+    }
+}
+
+impl<'a, 'b, T: ops::Mul<Output = T> + Clone> ops::Mul<&'b Matrix<T>> for &'a Matrix<T> {
+    type Output = Matrix<T>;
+    fn mul(self, other: &'b Matrix<T>) -> Matrix<T> {
+        self.make_op(&other, |a, b| a * b)
+    }
+}
+
+impl<'a, 'b, T: ops::Div<Output = T> + Clone> ops::Div<&'b Matrix<T>> for &'a Matrix<T> {
+    type Output = Matrix<T>;
+    fn div(self, other: &'b Matrix<T>) -> Matrix<T> {
+        self.make_op(&other, |a, b| a / b)
+    }
+}
+
+impl<T: fmt::Display + Clone> fmt::Display for Matrix<T> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        let mut elements = String::new();
+        for row in 0..self.rows {
+            for column in 0..self.columns {
+                elements.push_str(&format!("{} ", self.at(row, column).to_string()));
+            }
+            elements.push_str("\n");
+        }
+
+        let separator = "--------------";
+        let formatted = format!("Matrix {}x{}\n{}\n{}{}", self.rows, self.columns, separator, elements, separator);
+
+        write!(fmt, "{}", formatted)
+    }
+}
+
+impl<T: Clone> Clone for Matrix<T> {
+    fn clone(&self) -> Matrix<T> {
+        Matrix::new_from(self.rows, self.columns, self.elements.to_owned(), self.row_major)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseMatrixError {
+    message: String
+}
+impl ParseMatrixError {
+    #[doc(hidden)]
+    pub fn __description(&self) -> &str {
+        "could not parse matrix"
+    }
+}
+
+impl fmt::Display for ParseMatrixError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "could not parse matrix: {}", self.message)
+    }
+}
+
+impl<T> str::FromStr for Matrix<T>
+        where T: str::FromStr, <T as str::FromStr>::Err: fmt::Display {
+    type Err = ParseMatrixError;
+    fn from_str(s: &str) -> Result<Matrix<T>, ParseMatrixError> {
+        let lines: Vec<Vec<&str>> = s.trim().split('\n').map(|line| line.split(' ').collect()).collect();
+        let rows = lines.len();
+        let columns = lines[0].len();
+        let mut elems = Vec::with_capacity(rows * columns);
+        for row in 0..rows {
+            for col in 0..columns {
+                // print!("{} \n",row);
+                let num_i32: i32 = lines[row][col].replace("\r", "").parse().unwrap();
+                let f32_k: f32 = num_i32 as f32;
+                let str_k = f32_k.to_string();
+                let ssss = &str_k;
+                match T::from_str(ssss) {
+                    Ok(v) => elems.push(v),
+                    Err(e) => return Err(ParseMatrixError { message: e.to_string() })
+                }
+            }
+        }
+        Ok(Matrix::new_from(rows, columns, elems, true))
+    }
+}
